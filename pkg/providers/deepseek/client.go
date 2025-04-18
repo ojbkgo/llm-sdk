@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ojbkgo/llm-sdk/pkg/api"
+	"github.com/ojbkgo/llm-sdk/pkg/utils"
 )
 
 // Client 实现了DeepSeek的API客户端
@@ -164,7 +165,8 @@ func (c *Client) CompleteStream(ctx context.Context, request *api.Request) (api.
 	}
 
 	return &deepseekResponseStream{
-		reader: resp.Body,
+		reader:    utils.NewSSEReader(resp.Body),
+		rawReader: resp.Body,
 	}, nil
 }
 
@@ -266,6 +268,22 @@ type DeepSeekResponse struct {
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
+}
+
+// DeepSeekStreamResponse 定义DeepSeek API的流式响应结构
+type DeepSeekStreamResponse struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Index int `json:"index"`
+		Delta struct {
+			Content string `json:"content,omitempty"`
+			Role    string `json:"role,omitempty"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason,omitempty"`
+	} `json:"choices"`
 }
 
 // DeepSeekError 定义DeepSeek API的错误响应
@@ -370,18 +388,57 @@ func mapDeepSeekError(deepseekErr *DeepSeekError, statusCode int) *api.Error {
 
 // deepseekResponseStream 实现流式响应接口
 type deepseekResponseStream struct {
-	reader io.ReadCloser
-	buffer []byte
+	reader    *utils.SSEReader
+	rawReader io.ReadCloser
 }
 
 // Recv 实现ResponseStream接口，读取下一个响应块
 func (s *deepseekResponseStream) Recv() (*api.ResponseChunk, error) {
-	// 这里是简化实现，实际应该解析SSE事件流
-	// 真实实现需要处理SSE格式的数据流，如 data: {...} 格式
-	return nil, api.NewError(api.ErrorTypeUnknown, "流式响应功能尚未完全实现", 0, nil)
+	event, err := s.reader.ReadEvent()
+	if err != nil {
+		if err == io.EOF {
+			return nil, io.EOF
+		}
+		return nil, api.NewError(api.ErrorTypeServer, "读取SSE事件失败", 0, err)
+	}
+
+	// 如果不是data字段，或者数据为空，则跳过
+	if event.Data == "" || event.Data == "[DONE]" {
+		if event.Data == "[DONE]" {
+			return nil, io.EOF
+		}
+		return s.Recv() // 递归调用直到获取到有效数据或EOF
+	}
+
+	// 解析JSON数据
+	var streamResp DeepSeekStreamResponse
+	if err := json.Unmarshal([]byte(utils.ParseSSEData(event.Data)), &streamResp); err != nil {
+		return nil, api.NewError(api.ErrorTypeServer, "解析流式响应失败", 0, err)
+	}
+
+	// 转换为SDK的通用格式
+	choices := make([]api.ChunkChoice, len(streamResp.Choices))
+	for i, choice := range streamResp.Choices {
+		choices[i] = api.ChunkChoice{
+			Index: choice.Index,
+			Delta: api.Message{
+				Role:    api.Role(choice.Delta.Role),
+				Content: choice.Delta.Content,
+			},
+			FinishReason: choice.FinishReason,
+		}
+	}
+
+	return &api.ResponseChunk{
+		ID:      streamResp.ID,
+		Object:  streamResp.Object,
+		Created: streamResp.Created,
+		Model:   streamResp.Model,
+		Choices: choices,
+	}, nil
 }
 
 // Close 关闭流
 func (s *deepseekResponseStream) Close() error {
-	return s.reader.Close()
+	return s.rawReader.Close()
 }

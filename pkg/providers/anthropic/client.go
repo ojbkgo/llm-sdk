@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ojbkgo/llm-sdk/pkg/api"
+	"github.com/ojbkgo/llm-sdk/pkg/utils"
 )
 
 // Client 实现了Anthropic的API客户端
@@ -169,7 +170,8 @@ func (c *Client) CompleteStream(ctx context.Context, request *api.Request) (api.
 	}
 
 	return &anthropicResponseStream{
-		reader: resp.Body,
+		reader:    utils.NewSSEReader(resp.Body),
+		rawReader: resp.Body,
 	}, nil
 }
 
@@ -353,18 +355,125 @@ func mapAnthropicError(anthropicErr *AnthropicError, statusCode int) *api.Error 
 
 // anthropicResponseStream 实现流式响应接口
 type anthropicResponseStream struct {
-	reader io.ReadCloser
-	buffer []byte
+	reader    *utils.SSEReader
+	rawReader io.ReadCloser
+}
+
+// AnthropicStreamResponse 定义Anthropic API的流式响应结构
+type AnthropicStreamResponse struct {
+	Type         string                 `json:"type"`
+	Message      AnthropicStreamMessage `json:"message,omitempty"`
+	ContentBlock *AnthropicContentBlock `json:"content_block,omitempty"`
+	Delta        *AnthropicContentDelta `json:"delta,omitempty"`
+	Index        int                    `json:"index,omitempty"`
+}
+
+// AnthropicStreamMessage 定义Anthropic流式消息结构
+type AnthropicStreamMessage struct {
+	ID           string                  `json:"id"`
+	Type         string                  `json:"type"`
+	Role         string                  `json:"role"`
+	Content      []AnthropicContentBlock `json:"content"`
+	Model        string                  `json:"model"`
+	StopReason   string                  `json:"stop_reason,omitempty"`
+	StopSequence string                  `json:"stop_sequence,omitempty"`
+	Usage        struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage,omitempty"`
+}
+
+// AnthropicContentBlock 定义Anthropic内容块结构
+type AnthropicContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+// AnthropicContentDelta 定义Anthropic内容增量结构
+type AnthropicContentDelta struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
 }
 
 // Recv 实现ResponseStream接口，读取下一个响应块
 func (s *anthropicResponseStream) Recv() (*api.ResponseChunk, error) {
-	// 这里是简化实现，实际应该解析SSE事件流
-	// 真实实现需要处理SSE格式的数据流，如 data: {...} 格式
-	return nil, api.NewError(api.ErrorTypeUnknown, "流式响应功能尚未完全实现", 0, nil)
+	event, err := s.reader.ReadEvent()
+	if err != nil {
+		if err == io.EOF {
+			return nil, io.EOF
+		}
+		return nil, api.NewError(api.ErrorTypeServer, "读取SSE事件失败", 0, err)
+	}
+
+	// 如果不是data字段，或者数据为空，则跳过
+	if event.Data == "" {
+		return s.Recv() // 递归调用直到获取到有效数据或EOF
+	}
+
+	// 解析JSON数据
+	var streamResp AnthropicStreamResponse
+	if err := json.Unmarshal([]byte(utils.ParseSSEData(event.Data)), &streamResp); err != nil {
+		return nil, api.NewError(api.ErrorTypeServer, "解析流式响应失败", 0, err)
+	}
+
+	// 判断事件类型
+	switch streamResp.Type {
+	// 消息完成事件
+	case "message_stop":
+		return nil, io.EOF
+
+	// 内容块事件
+	case "content_block_delta":
+		if streamResp.Delta == nil || streamResp.Delta.Type != "text" {
+			return s.Recv() // 非文本内容，继续获取下一个事件
+		}
+		choices := []api.ChunkChoice{
+			{
+				Index: streamResp.Index,
+				Delta: api.Message{
+					Role:    api.RoleAssistant,
+					Content: streamResp.Delta.Text,
+				},
+			},
+		}
+
+		return &api.ResponseChunk{
+			ID:      "", // Anthropic流式API不在每个块中提供ID
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   "", // 同样，模型信息仅在消息完成后提供
+			Choices: choices,
+		}, nil
+
+	// 内容块开始事件
+	case "content_block_start":
+		if streamResp.ContentBlock == nil || streamResp.ContentBlock.Type != "text" {
+			return s.Recv() // 非文本内容，继续获取下一个事件
+		}
+		// 通常这个事件不包含实际文本内容，可以跳过
+		return s.Recv()
+
+	// 消息开始事件
+	case "message_start":
+		// 消息开始事件不包含内容，可以跳过
+		return s.Recv()
+
+	// 消息完成事件
+	case "message_delta":
+		// 如果消息包含停止原因，返回EOF
+		if streamResp.Message.StopReason != "" {
+			return nil, io.EOF
+		}
+		// 否则继续接收
+		return s.Recv()
+
+	// 未识别的事件类型
+	default:
+		return s.Recv()
+	}
 }
 
 // Close 关闭流
 func (s *anthropicResponseStream) Close() error {
-	return s.reader.Close()
+	return s.rawReader.Close()
 }

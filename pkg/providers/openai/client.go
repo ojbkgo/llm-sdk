@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ojbkgo/llm-sdk/pkg/api"
+	"github.com/ojbkgo/llm-sdk/pkg/utils"
 )
 
 // Client 实现了OpenAI的API客户端
@@ -119,9 +120,54 @@ func (c *Client) Complete(ctx context.Context, request *api.Request) (*api.Respo
 
 // CompleteStream 发送请求并获取流式响应
 func (c *Client) CompleteStream(ctx context.Context, request *api.Request) (api.ResponseStream, error) {
-	// 这里实现流式响应，类似于Complete方法，但返回一个Stream接口
-	// 简化起见，这里省略部分实现细节
-	return nil, api.NewError(api.ErrorTypeUnknown, "流式响应功能尚未实现", 0, nil)
+	// 验证请求
+	if err := validateRequest(request); err != nil {
+		return nil, err
+	}
+
+	// 设置流式标志
+	reqCopy := *request
+	reqCopy.Stream = true
+
+	// 准备请求体
+	reqBody, err := json.Marshal(adaptRequest(&reqCopy))
+	if err != nil {
+		return nil, api.NewError(api.ErrorTypeInvalidRequest, "无法序列化请求", 0, err)
+	}
+
+	// 创建HTTP请求
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, api.NewError(api.ErrorTypeConnection, "创建HTTP请求失败", 0, err)
+	}
+
+	// 设置请求头
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Accept", "text/event-stream")
+
+	// 发送请求
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, api.NewError(api.ErrorTypeConnection, "HTTP请求失败", 0, err)
+	}
+
+	// 检查HTTP状态码
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+
+		var openaiErr OpenAIError
+		if err := json.Unmarshal(body, &openaiErr); err != nil {
+			return nil, api.NewError(api.ErrorTypeServer, fmt.Sprintf("API错误(状态码: %d)", resp.StatusCode), resp.StatusCode, nil)
+		}
+		return nil, mapOpenAIError(&openaiErr, resp.StatusCode)
+	}
+
+	return &openaiResponseStream{
+		reader:    utils.NewSSEReader(resp.Body),
+		rawReader: resp.Body,
+	}, nil
 }
 
 // Embedding 获取文本的嵌入向量
@@ -262,4 +308,77 @@ func mapOpenAIError(openaiErr *OpenAIError, statusCode int) *api.Error {
 		Param:      openaiErr.Error.Param,
 		Code:       openaiErr.Error.Code,
 	}
+}
+
+// openaiResponseStream 实现流式响应接口
+type openaiResponseStream struct {
+	reader    *utils.SSEReader
+	rawReader io.ReadCloser
+}
+
+// OpenAIStreamResponse 定义OpenAI API的流式响应结构
+type OpenAIStreamResponse struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Index int `json:"index"`
+		Delta struct {
+			Content string `json:"content,omitempty"`
+			Role    string `json:"role,omitempty"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason,omitempty"`
+	} `json:"choices"`
+}
+
+// Recv 实现ResponseStream接口，读取下一个响应块
+func (s *openaiResponseStream) Recv() (*api.ResponseChunk, error) {
+	event, err := s.reader.ReadEvent()
+	if err != nil {
+		if err == io.EOF {
+			return nil, io.EOF
+		}
+		return nil, api.NewError(api.ErrorTypeServer, "读取SSE事件失败", 0, err)
+	}
+
+	// 如果不是data字段，或者数据为空，则跳过
+	if event.Data == "" || event.Data == "[DONE]" {
+		if event.Data == "[DONE]" {
+			return nil, io.EOF
+		}
+		return s.Recv() // 递归调用直到获取到有效数据或EOF
+	}
+
+	// 解析JSON数据
+	var streamResp OpenAIStreamResponse
+	if err := json.Unmarshal([]byte(utils.ParseSSEData(event.Data)), &streamResp); err != nil {
+		return nil, api.NewError(api.ErrorTypeServer, "解析流式响应失败", 0, err)
+	}
+
+	// 转换为SDK的通用格式
+	choices := make([]api.ChunkChoice, len(streamResp.Choices))
+	for i, choice := range streamResp.Choices {
+		choices[i] = api.ChunkChoice{
+			Index: choice.Index,
+			Delta: api.Message{
+				Role:    api.Role(choice.Delta.Role),
+				Content: choice.Delta.Content,
+			},
+			FinishReason: choice.FinishReason,
+		}
+	}
+
+	return &api.ResponseChunk{
+		ID:      streamResp.ID,
+		Object:  streamResp.Object,
+		Created: streamResp.Created,
+		Model:   streamResp.Model,
+		Choices: choices,
+	}, nil
+}
+
+// Close 关闭流
+func (s *openaiResponseStream) Close() error {
+	return s.rawReader.Close()
 }
